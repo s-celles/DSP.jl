@@ -59,6 +59,10 @@ end
         @test conv(f32a, b) ≈ fexp
         @test conv(fb, a) ≈ fexp
 
+        u = rand(100)
+        v = rand(200)
+        @test conv(u, v; algorithm=:direct) ≈ conv(u, v; algorithm=:fft) ≈ conv(u, v; algorithm=:overlapsave)
+
         # issue #410
         n = 314159265
         @test conv([n], [n]) == [n^2]
@@ -112,6 +116,10 @@ end
         @test conv(fa, b) ≈ fexp
         @test conv(f32a, b) ≈ fexp
         @test conv(fb, a) ≈ fexp
+
+        u = rand(10, 20)
+        v = rand(10, 10)
+        @test conv(u, v; algorithm=:direct) ≈ conv(u, v; algorithm=:fft) ≈ conv(u, v; algorithm=:overlapsave)
 
         offset_arr = OffsetMatrix{Int}(undef, -1:1, -1:1)
         offset_arr[:] = a
@@ -197,7 +205,7 @@ end
             su, u = os_test_data(T, nu, N)
             sv, v = os_test_data(T, nv, N)
             sout = su .+ sv .- 1
-            out = _conv_similar(u, sout, axes(u), axes(v))
+            out = _conv_similar(u, T, sout, axes(u), axes(v))
             unsafe_conv_kern_os!(out, u, v, su, sv, sout, nffts)
             os_out = copy(out)
             fft_nfft = nextfastfft(sout)

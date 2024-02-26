@@ -637,65 +637,39 @@ function _conv_kern_fft!(out, u, v, su, sv, outsize, nffts)
             CartesianIndices(UnitRange.(1, outsize)))
 end
 
-# v should be smaller than u for good performance
-function _conv_fft!(out, u, v, su, sv, outsize)
-    os_nffts = map(optimalfftfiltlength, sv, su)
-    if any(os_nffts .< outsize)
-        unsafe_conv_kern_os!(out, u, v, su, sv, outsize, os_nffts)
-    else
-        nffts = nextfastfft(outsize)
-        _conv_kern_fft!(out, u, v, su, sv, outsize, nffts)
-    end
-end
-
-
 # For arrays with weird offsets
-function _conv_similar(u, outsize, axesu, axesv)
+function _conv_similar(u, ::Type{T}, outsize, axesu, axesv) where {T}
     out_offsets = first.(axesu) .+ first.(axesv)
     out_axes = UnitRange.(out_offsets, out_offsets .+ outsize .- 1)
-    similar(u, out_axes)
+    similar(u, T, out_axes)
 end
 function _conv_similar(
-    u, outsize, ::NTuple{<:Any, Base.OneTo{Int}}, ::NTuple{<:Any, Base.OneTo{Int}}
-)
-    similar(u, outsize)
+    u, ::Type{T}, outsize, ::NTuple{<:Any, Base.OneTo{Int}}, ::NTuple{<:Any, Base.OneTo{Int}}
+) where {T}
+    similar(u, T, outsize)
 end
-_conv_similar(u, v, outsize) = _conv_similar(u, outsize, axes(u), axes(v))
-
-# Does convolution, will not switch argument order
-function _conv!(out, u, v, su, sv, outsize)
-    # TODO: Add spatial / time domain algorithm
-    _conv_fft!(out, u, v, su, sv, outsize)
+function _conv_similar(u::AbstractArray{Tu}, v::AbstractArray{Tv}, outsize) where {Tu, Tv}
+    T = promote_type(Tu, Tv)
+    _conv_similar(u, T, outsize, axes(u), axes(v))
 end
 
-# Does convolution, will not switch argument order
-function _conv(u, v, su, sv)
-    outsize = su .+ sv .- 1
-    out = _conv_similar(u, v, outsize)
-    _conv!(out, u, v, su, sv, outsize)
-end
-
-function _conv_td(u::AbstractArray{<:Number, N}, v::AbstractArray{<:Number, N}) where {N}
+function _conv_td!(out, u::AbstractArray{<:Number, N}, v::AbstractArray{<:Number, N}) where {N}
     output_indices = CartesianIndices(map(axes(u), axes(v)) do au, av
-        r = (first(au)+first(av)):(last(au)+last(av))
-        if au isa Base.OneTo && av isa Base.OneTo
-            return r
-        else
-            return Base.IdentityUnitRange(r)
-        end
+        return (first(au)+first(av)):(last(au)+last(av))
     end)
-    return [
+    copyto!(
+	out,
         sum(u[m] * v[n-m]
             for m in CartesianIndices(ntuple(Val(N)) do d
                 max(firstindex(u,d),n[d]-lastindex(v,d)):min(lastindex(u,d), n[d]-firstindex(v,d))
             end)
         )
         for n in output_indices
-    ]
+    )
+    return out
 end
 
-# We use this type definition for clarity
-const RealOrComplexFloat = Union{AbstractFloat, Complex{T} where T<:AbstractFloat}
+const FFTTypes = Union{Float32, Float64, ComplexF32, ComplexF64}
 
 # May switch argument order
 """
@@ -705,46 +679,49 @@ Convolution of two arrays. Uses either FFT convolution or overlap-save,
 depending on the size of the input. `u` and `v` can be  N-dimensional arrays,
 with arbitrary indexing offsets, but their axes must be a `UnitRange`.
 """
-function conv(u::AbstractArray{T, N},
-              v::AbstractArray{T, N}) where {T<:RealOrComplexFloat, N}
+function conv(u::AbstractArray{Tu, N},
+              v::AbstractArray{Tv, N};
+              algorithm=promote_type(Tu, Tv) <: FFTTypes ? :auto : :direct
+) where {Tu<:Number, Tv<:Number, N}
+    if length(u) < length(v)
+        return conv(v, u; algorithm)
+    end
     su = size(u)
     sv = size(v)
-    if length(u) >= length(v)
-        _conv(u, v, su, sv)
+    outsize = su .+ sv .- 1
+    out = _conv_similar(u, v, outsize)
+
+    if algorithm===:auto && length(u) * length(v) < 2^16 # TODO: better heuristic
+        algorithm = :direct
+    end
+    if algorithm===:direct
+        return _conv_td!(out, u, v)
+    end
+
+    os_nffts = map(optimalfftfiltlength, sv, su)
+    if algorithm===:auto
+        if any(os_nffts .< outsize)
+            algorithm = :overlapsave
+        else
+            algorithm = :fft
+        end
+    end
+    if algorithm===:fft
+        return _conv_kern_fft!(out, u, v, su, sv, outsize, nextfastfft(outsize))
+    elseif algorithm===:overlapsave
+        return unsafe_conv_kern_os!(out, u, v, su, sv, outsize, os_nffts)
     else
-        _conv(v, u, sv, su)
+        throw(ArgumentError("algorithm must be :auto, :direct, :fft, or :overlapsave"))
     end
 end
 
-function conv(u::AbstractArray{<:RealOrComplexFloat, N},
-              v::AbstractArray{<:RealOrComplexFloat, N}) where N
-    fu, fv = promote(u, v)
-    conv(fu, fv)
-end
-
-conv(u::AbstractArray{<:Integer, N}, v::AbstractArray{<:Integer, N}) where {N} =
-    _conv_td(u, v)
-
-conv(u::AbstractArray{<:Number, N}, v::AbstractArray{<:Number, N}) where {N} =
-    conv(float(u), float(v))
-
-function conv(u::AbstractArray{<:Number, N},
-              v::AbstractArray{<:RealOrComplexFloat, N}) where N
-    conv(float(u), v)
-end
-
-function conv(u::AbstractArray{<:RealOrComplexFloat, N},
-              v::AbstractArray{<:Number, N}) where N
-    conv(u, float(v))
-end
-
 function conv(A::AbstractArray{<:Number, M},
-              B::AbstractArray{<:Number, N}) where {M, N}
+              B::AbstractArray{<:Number, N}; kwargs...) where {M, N}
     if (M < N)
-        conv(cat(A, dims=N)::AbstractArray{eltype(A), N}, B)
+        conv(cat(A, dims=N)::AbstractArray{eltype(A), N}, B; kwargs...)
     else
         @assert M > N
-        conv(A, cat(B, dims=M)::AbstractArray{eltype(B), M})
+        conv(A, cat(B, dims=M)::AbstractArray{eltype(B), M}; kwargs...)
     end
 end
 
